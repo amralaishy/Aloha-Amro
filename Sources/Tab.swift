@@ -62,6 +62,51 @@ enum Scripts {
     })();
     """
 
+    static let video = #"""
+    (function(){
+      if (window.__lumenVid) return; window.__lumenVid = true;
+      function fix(v){ v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline',''); v.style.webkitTouchCallout='none'; }
+      function scan(){ document.querySelectorAll('video').forEach(fix); }
+      new MutationObserver(scan).observe(document, {childList:true, subtree:true});
+      document.addEventListener('DOMContentLoaded', scan);
+      var timer=null, sx=0, sy=0;
+      function videoAt(x,y){
+        var els = document.elementsFromPoint(x,y);
+        for (var i=0;i<els.length;i++){ if(els[i].tagName==='VIDEO') return els[i]; }
+        var vs=document.querySelectorAll('video');
+        for (var j=0;j<vs.length;j++){ var r=vs[j].getBoundingClientRect();
+          if(r.width>100 && x>=r.left && x<=r.right && y>=r.top && y<=r.bottom) return vs[j]; }
+        return null;
+      }
+      function collect(v){
+        var out=[];
+        function add(u,l){ if(!u) return; if(u.indexOf('http')!==0 && u.indexOf('blob:')!==0) return; out.push({url:u,label:l||''}); }
+        add(v.currentSrc||v.src,'');
+        v.querySelectorAll('source').forEach(function(s){
+          add(s.src, s.getAttribute('label')||s.getAttribute('title')||s.getAttribute('res')||(s.getAttribute('size')?s.getAttribute('size')+'p':''));
+        });
+        try{ performance.getEntriesByType('resource').forEach(function(e){
+          if(/\.(m3u8|mp4|m4v|webm|mov)(\?|$)/i.test(e.name)) add(e.name,''); }); }catch(e){}
+        return out;
+      }
+      document.addEventListener('touchstart', function(e){
+        if(e.touches.length!==1) return;
+        var t=e.touches[0]; sx=t.clientX; sy=t.clientY;
+        clearTimeout(timer);
+        timer=setTimeout(function(){
+          var v=videoAt(sx,sy); if(!v) return;
+          window.webkit.messageHandlers.videoMenu.postMessage({page:location.href, title:document.title, sources:collect(v)});
+        }, 650);
+      }, {passive:true, capture:true});
+      ['touchmove','touchend','touchcancel'].forEach(function(n){
+        document.addEventListener(n, function(e){
+          if(n==='touchmove' && e.touches[0] && Math.abs(e.touches[0].clientX-sx)<12 && Math.abs(e.touches[0].clientY-sy)<12) return;
+          clearTimeout(timer);
+        }, {passive:true, capture:true});
+      });
+    })();
+    """#
+
     static let media = """
     (function(){var r=[];document.querySelectorAll('video,audio,source,a[href]').forEach(function(e){
       var s=e.currentSrc||e.src||e.href||''; if(s.indexOf('http')!==0) return;
@@ -106,8 +151,9 @@ final class Tab: NSObject, ObservableObject, Identifiable, WKNavigationDelegate,
         webView.allowsBackForwardNavigationGestures = true
 
         let ucc = c.userContentController
-        for n in ["hide", "insecureForm", "savePassword"] { ucc.add(ScriptProxy(self), name: n) }
+        for n in ["hide", "insecureForm", "savePassword", "videoMenu"] { ucc.add(ScriptProxy(self), name: n) }
         ucc.addUserScript(WKUserScript(source: Scripts.forms, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+        ucc.addUserScript(WKUserScript(source: Scripts.video, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         AdBlock.shared.attach(ucc)
 
         obs = [
@@ -188,7 +234,29 @@ final class Tab: NSObject, ObservableObject, Identifiable, WKNavigationDelegate,
             confirm("Save password?", "Save the password for \(u.isEmpty ? h : u) on \(h)?", ok: "Save") { yes in
                 if yes { Keychain.save(host: h, user: u, pass: p) }
             }
+        case "videoMenu":
+            guard let arr = body["sources"] as? [[String: Any]] else { return }
+            var seen = Set<String>()
+            let cands: [VideoCandidate] = arr.compactMap { d in
+                guard let u = d["url"] as? String, seen.insert(u).inserted else { return nil }
+                return VideoCandidate(url: u, label: d["label"] as? String ?? "")
+            }
+            let name = (body["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? (url?.host ?? "video")
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            syncCookies { [weak self] in
+                guard let self else { return }
+                self.store?.videoPicker = VideoPicker(title: name, page: self.url, candidates: cands)
+            }
         default: break
+        }
+    }
+
+    /// Lets downloads reuse the site's login/session cookies (skipped in private tabs).
+    func syncCookies(_ done: @escaping () -> Void) {
+        if isPrivate { done(); return }
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { cookies in
+            cookies.forEach { HTTPCookieStorage.shared.setCookie($0) }
+            DispatchQueue.main.async(execute: done)
         }
     }
 

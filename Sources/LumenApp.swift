@@ -18,6 +18,7 @@ struct LumenApp: App {
                 .environmentObject(store)
                 .environmentObject(settings)
                 .tint(settings.theme.accent)
+                .preferredColorScheme(settings.scheme)
         }
     }
 }

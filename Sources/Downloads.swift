@@ -11,6 +11,9 @@ final class DownloadItem: ObservableObject, Identifiable {
     var wk: WKDownload?
     var task: URLSessionDownloadTask?
     var obs: NSKeyValueObservation?
+    var preferredName: String?
+    var job: Task<Void, Never>?
+    @Published var note: String?
     init(name: String) { self.name = name }
 }
 
@@ -50,9 +53,15 @@ final class DownloadManager: NSObject, ObservableObject, WKDownloadDelegate, URL
     }
 
     // MARK: direct URL downloads
-    func start(url: URL) {
-        let item = DownloadItem(name: url.lastPathComponent.isEmpty ? "file" : url.lastPathComponent)
-        let t = session.downloadTask(with: url)
+    func start(url: URL, name: String? = nil, referer: URL? = nil) {
+        let item = DownloadItem(name: name ?? (url.lastPathComponent.isEmpty ? "file" : url.lastPathComponent))
+        if let name {
+            let e = url.pathExtension
+            item.preferredName = (e.isEmpty || e.count > 5) ? name + ".mp4" : name + "." + e
+        }
+        var req = URLRequest(url: url)
+        if let referer { req.setValue(referer.absoluteString, forHTTPHeaderField: "Referer") }
+        let t = session.downloadTask(with: req)
         item.task = t
         taskMap[t.taskIdentifier] = item
         items.insert(item, at: 0)
@@ -66,7 +75,12 @@ final class DownloadManager: NSObject, ObservableObject, WKDownloadDelegate, URL
 
     func urlSession(_ s: URLSession, downloadTask t: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
         guard let item = taskMap[t.taskIdentifier] else { return }
-        let name = t.response?.suggestedFilename ?? item.name
+        if let h = t.response as? HTTPURLResponse, h.statusCode >= 400 {
+            item.state = .failed; item.note = "Server refused the download (HTTP \(h.statusCode))"
+            try? FileManager.default.removeItem(at: location)
+            updateBackground(); return
+        }
+        let name = item.preferredName ?? t.response?.suggestedFilename ?? item.name
         let dest = uniqueURL(Paths.downloads, name)
         do {
             try FileManager.default.moveItem(at: location, to: dest)
@@ -108,7 +122,55 @@ final class DownloadManager: NSObject, ObservableObject, WKDownloadDelegate, URL
         updateBackground()
     }
 
+    func startHLS(_ v: HLSVariant, title: String, referer: URL?) {
+        let item = DownloadItem(name: "\(title) \(v.label)")
+        items.insert(item, at: 0)
+        updateBackground()
+        let hasAudio = v.audio != nil
+        item.job = Task {
+            let tmp = FileManager.default.temporaryDirectory
+            var temps: [URL] = []
+            defer { temps.forEach { try? FileManager.default.removeItem(at: $0) } }
+            do {
+                let vBase = tmp.appendingPathComponent(UUID().uuidString)
+                let ext = try await HLS.download(playlist: v.url, referer: referer, to: vBase) { p in
+                    DispatchQueue.main.async { item.progress = hasAudio ? p * 0.8 : p }
+                }
+                let vFile = vBase.appendingPathExtension(ext)
+                try FileManager.default.moveItem(at: vBase, to: vFile)
+                temps.append(vFile)
+                let dest = self.uniqueURL(Paths.downloads, "\(title) \(v.label).\(ext)")
+                if let a = v.audio, ext == "mp4" {
+                    let aBase = tmp.appendingPathComponent(UUID().uuidString)
+                    let aExt = try await HLS.download(playlist: a, referer: referer, to: aBase) { p in
+                        DispatchQueue.main.async { item.progress = 0.8 + p * 0.15 }
+                    }
+                    let aFile = aBase.appendingPathExtension(aExt)
+                    try FileManager.default.moveItem(at: aBase, to: aFile)
+                    temps.append(aFile)
+                    try await HLS.merge(video: vFile, audio: aFile, to: dest)
+                } else {
+                    try FileManager.default.moveItem(at: vFile, to: dest)
+                }
+                await MainActor.run {
+                    item.dest = dest; item.name = dest.lastPathComponent
+                    item.progress = 1; item.state = .done
+                    self.updateBackground()
+                }
+            } catch {
+                await MainActor.run {
+                    item.state = .failed
+                    if case HLSError.drm = error { item.note = "DRM-protected, can't be saved" }
+                    else if error is CancellationError { item.note = "Cancelled" }
+                    else { item.note = "Download failed" }
+                    self.updateBackground()
+                }
+            }
+        }
+    }
+
     func cancel(_ item: DownloadItem) {
+        item.job?.cancel()
         item.wk?.cancel { _ in }
         item.task?.cancel()
         item.state = .failed
@@ -157,7 +219,7 @@ struct DownloadRow: View {
                     Button { DownloadManager.shared.cancel(item) } label: { Image(systemName: "xmark.circle") }
                 }
             case .done: Label("Saved to Files › Downloads", systemImage: "checkmark.circle").font(.caption).foregroundColor(.green)
-            case .failed: Label("Failed", systemImage: "exclamationmark.triangle").font(.caption).foregroundColor(.red)
+            case .failed: Label(item.note ?? "Failed", systemImage: "exclamationmark.triangle").font(.caption).foregroundColor(.red)
             }
         }
     }

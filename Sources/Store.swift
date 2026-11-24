@@ -16,10 +16,11 @@ struct HistoryItem: Identifiable, Codable {
 }
 
 enum AppTheme: String, CaseIterable, Identifiable {
-    case ocean, sunset, forest, graphite
+    case midnight, ocean, sunset, forest, graphite
     var id: String { rawValue }
     var accent: Color {
         switch self {
+        case .midnight: return Color(red: 0.31, green: 0.55, blue: 1.0)
         case .ocean: return .blue
         case .sunset: return .orange
         case .forest: return .green
@@ -28,6 +29,7 @@ enum AppTheme: String, CaseIterable, Identifiable {
     }
     var colors: [Color] {
         switch self {
+        case .midnight: return [Color(red: 0.03, green: 0.04, blue: 0.10), Color(red: 0.14, green: 0.12, blue: 0.34)]
         case .ocean: return [Color(red: 0.05, green: 0.25, blue: 0.5), Color(red: 0.2, green: 0.6, blue: 0.8)]
         case .sunset: return [Color(red: 0.6, green: 0.15, blue: 0.3), Color(red: 0.98, green: 0.6, blue: 0.2)]
         case .forest: return [Color(red: 0.05, green: 0.3, blue: 0.2), Color(red: 0.4, green: 0.7, blue: 0.4)]
@@ -87,6 +89,11 @@ final class Settings: ObservableObject {
     @Published var hidden: [String: [String]] { didSet { saveJSON(hidden, "hidden") } }
     @Published var lockedFiles: [String] { didSet { saveJSON(lockedFiles, "lockedFiles") } }
     @Published var wallpaperVersion = 0
+    @Published var addressAtBottom: Bool { didSet { d.set(addressAtBottom, forKey: "addressAtBottom") } }
+    @Published var appearance: String { didSet { d.set(appearance, forKey: "appearance") } }
+    var scheme: ColorScheme? {
+        switch appearance { case "light": return .light; case "system": return nil; default: return .dark }
+    }
 
     init() {
         adblock = d.object(forKey: "adblock") as? Bool ?? true
@@ -96,7 +103,9 @@ final class Settings: ObservableObject {
         homeButton = d.bool(forKey: "homeButton")
         desktopDefault = d.bool(forKey: "desktopDefault")
         engine = SearchEngine(rawValue: d.string(forKey: "engine") ?? "") ?? .duckduckgo
-        theme = AppTheme(rawValue: d.string(forKey: "theme") ?? "") ?? .ocean
+        theme = AppTheme(rawValue: d.string(forKey: "theme") ?? "") ?? .midnight
+        addressAtBottom = d.object(forKey: "addressAtBottom") as? Bool ?? true
+        appearance = d.string(forKey: "appearance") ?? "dark"
         customFilters = loadJSON("customFilters", [String]())
         hidden = loadJSON("hidden", [String: [String]]())
         lockedFiles = loadJSON("lockedFiles", [String]())
@@ -111,7 +120,11 @@ final class Settings: ObservableObject {
     }
 }
 
+struct VideoCandidate: Hashable { let url: String; let label: String }
+struct VideoPicker: Identifiable { let id = UUID(); let title: String; let page: URL?; let candidates: [VideoCandidate] }
+
 final class BrowserStore: ObservableObject {
+    @Published var videoPicker: VideoPicker?
     @Published var tabs: [Tab] = []
     @Published var currentID: UUID?
     @Published var bookmarks: [Bookmark] { didSet { saveJSON(bookmarks, "bookmarks") } }

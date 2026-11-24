@@ -39,9 +39,7 @@ struct BrowserPage: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            addressBar
-            if tab.isLoading { ProgressView(value: tab.progress).progressViewStyle(.linear) }
-            if showFind { findBar }
+            if !settings.addressAtBottom { chrome }
             ZStack {
                 if tab.isHome { HomeView(tab: tab) } else { WebViewHost(tab: tab) }
                 if let toast {
@@ -49,6 +47,8 @@ struct BrowserPage: View {
                         .frame(maxHeight: .infinity, alignment: .bottom).padding(.bottom, 20)
                 }
             }
+            .sheet(item: $store.videoPicker) { p in VideoPickerView(picker: p) }
+            if settings.addressAtBottom { chrome }
             bottomBar
         }
         .sheet(item: $sheet) { s in
@@ -78,6 +78,14 @@ struct BrowserPage: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { toast = nil }
     }
 
+    private var chrome: some View {
+        VStack(spacing: 0) {
+            if showFind { findBar }
+            addressBar
+            if tab.isLoading { ProgressView(value: tab.progress).progressViewStyle(.linear) }
+        }
+    }
+
     private var addressBar: some View {
         HStack(spacing: 8) {
             if tab.isPrivate { Image(systemName: "eye.slash.fill").foregroundColor(.purple) }
@@ -95,7 +103,8 @@ struct BrowserPage: View {
                 } label: { Image(systemName: tab.isLoading ? "xmark" : "arrow.clockwise") }
                 .foregroundColor(.secondary)
             }
-            .padding(10).background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+            .padding(.horizontal, 14).padding(.vertical, 10).background(Color(.secondarySystemBackground), in: Capsule())
+            .overlay(Capsule().stroke(focused ? settings.theme.accent : Color.clear, lineWidth: 1.5))
         }
         .padding(.horizontal).padding(.vertical, 6)
     }
@@ -185,7 +194,7 @@ struct HomeView: View {
                         Button { if let u = URL(string: item.url) { tab.load(u) } } label: {
                             VStack {
                                 Text(String(item.title.prefix(1)).uppercased()).font(.title.bold())
-                                    .frame(width: 60, height: 60).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                                    .frame(width: 60, height: 60).background(LinearGradient(colors: [settings.theme.accent, settings.theme.accent.opacity(0.45)], startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 18))
                                 Text(item.title).font(.caption).lineLimit(1)
                             }
                         }
@@ -411,6 +420,10 @@ struct SettingsView: View {
                 }
                 Section("Appearance") {
                     Picker("Theme", selection: $settings.theme) { ForEach(AppTheme.allCases) { Text($0.rawValue.capitalized).tag($0) } }
+                    Picker("Appearance", selection: $settings.appearance) {
+                        Text("Dark").tag("dark"); Text("Light").tag("light"); Text("System").tag("system")
+                    }
+                    Toggle("Address bar at bottom", isOn: $settings.addressAtBottom)
                     PhotosPicker("Choose wallpaper", selection: $photo, matching: .images)
                     Button("Remove wallpaper") { try? FileManager.default.removeItem(at: Paths.wallpaper); settings.wallpaperVersion += 1 }
                 }
