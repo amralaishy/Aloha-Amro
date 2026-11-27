@@ -98,6 +98,7 @@ struct FolderView: View {
         if mediaExt.contains(e) { return "music.note" }
         if e == "pdf" { return "doc.richtext" }
         if e == "zip" { return "doc.zipper" }
+        if ["ts", "m2ts", "mts"].contains(e) { return "film.stack" }
         return "doc"
     }
 
@@ -114,6 +115,9 @@ struct FolderView: View {
             }
             if videoExt.contains(u.pathExtension.lowercased()) {
                 Button { auth(u) { trimming = u } } label: { Label("Trim video", systemImage: "scissors") }
+            }
+            if ["ts", "m2ts", "mts"].contains(u.pathExtension.lowercased()) {
+                Button { convertToMP4(u) } label: { Label("Convert to MP4", systemImage: "film") }
             }
             if u.pathExtension.lowercased() == "zip" {
                 Button { extract(u) } label: { Label("Extract", systemImage: "arrow.down.doc") }
@@ -169,6 +173,19 @@ struct FolderView: View {
         if let i = settings.lockedFiles.firstIndex(of: rel(u)) {
             Auth.authenticate(reason: "Remove lock") { if $0 { settings.lockedFiles.remove(at: i) } }
         } else { settings.lockedFiles.append(rel(u)) }
+    }
+
+    private func convertToMP4(_ u: URL) {
+        info = "Converting to MP4 in the background. Check this folder in a minute."
+        let dest = DownloadManager.shared.uniqueURL(u.deletingLastPathComponent(), u.deletingPathExtension().lastPathComponent + ".mp4")
+        Task.detached(priority: .userInitiated) {
+            do {
+                try TSRemux.convert(ts: u, to: dest)
+                await MainActor.run { info = "Converted: \(dest.lastPathComponent)"; reload() }
+            } catch {
+                await MainActor.run { info = "Couldn't convert this file. Only H.264 video with AAC audio is supported." }
+            }
+        }
     }
 
     private func compress(_ u: URL) {

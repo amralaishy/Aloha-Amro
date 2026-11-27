@@ -134,13 +134,28 @@ final class DownloadManager: NSObject, ObservableObject, WKDownloadDelegate, URL
             do {
                 let vBase = tmp.appendingPathComponent(UUID().uuidString)
                 let ext = try await HLS.download(playlist: v.url, referer: referer, to: vBase) { p in
-                    DispatchQueue.main.async { item.progress = hasAudio ? p * 0.8 : p }
+                    DispatchQueue.main.async { item.progress = hasAudio ? p * 0.8 : p * 0.9 }
                 }
                 let vFile = vBase.appendingPathExtension(ext)
                 try FileManager.default.moveItem(at: vBase, to: vFile)
                 temps.append(vFile)
-                let dest = self.uniqueURL(Paths.downloads, "\(title) \(v.label).\(ext)")
-                if let a = v.audio, ext == "mp4" {
+                var dest = self.uniqueURL(Paths.downloads, "\(title) \(v.label).mp4")
+                var note: String?
+                if ext == "ts" {
+                    // Transport-stream segments: repackage as a real MP4 (no re-encoding)
+                    do {
+                        let out = dest
+                        try await Task.detached(priority: .userInitiated) {
+                            try TSRemux.convert(ts: vFile, to: out) { p in
+                                DispatchQueue.main.async { item.progress = 0.9 + p * 0.1 }
+                            }
+                        }.value
+                    } catch {
+                        dest = self.uniqueURL(Paths.downloads, "\(title) \(v.label).ts")
+                        try FileManager.default.moveItem(at: vFile, to: dest)
+                        note = "Saved as .ts (couldn't convert to MP4)"
+                    }
+                } else if let a = v.audio {
                     let aBase = tmp.appendingPathComponent(UUID().uuidString)
                     let aExt = try await HLS.download(playlist: a, referer: referer, to: aBase) { p in
                         DispatchQueue.main.async { item.progress = 0.8 + p * 0.15 }
@@ -152,9 +167,10 @@ final class DownloadManager: NSObject, ObservableObject, WKDownloadDelegate, URL
                 } else {
                     try FileManager.default.moveItem(at: vFile, to: dest)
                 }
+                let finalDest = dest, finalNote = note
                 await MainActor.run {
-                    item.dest = dest; item.name = dest.lastPathComponent
-                    item.progress = 1; item.state = .done
+                    item.dest = finalDest; item.name = finalDest.lastPathComponent
+                    item.progress = 1; item.note = finalNote; item.state = .done
                     self.updateBackground()
                 }
             } catch {
@@ -218,7 +234,7 @@ struct DownloadRow: View {
                     ProgressView(value: item.progress)
                     Button { DownloadManager.shared.cancel(item) } label: { Image(systemName: "xmark.circle") }
                 }
-            case .done: Label("Saved to Files › Downloads", systemImage: "checkmark.circle").font(.caption).foregroundColor(.green)
+            case .done: Label(item.note ?? "Saved to Files › Downloads", systemImage: item.note == nil ? "checkmark.circle" : "exclamationmark.circle").font(.caption).foregroundColor(item.note == nil ? .green : .orange)
             case .failed: Label(item.note ?? "Failed", systemImage: "exclamationmark.triangle").font(.caption).foregroundColor(.red)
             }
         }
