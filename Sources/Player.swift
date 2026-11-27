@@ -37,7 +37,7 @@ final class PlayerModel: ObservableObject {
     private var token: Any?
 
     init(url: URL) {
-        player = AVPlayer(url: url)
+        player = AVPlayer(url: TSPlayback.playableURL(for: url))
         token = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] t in
             guard let self else { return }
             self.time = t.seconds

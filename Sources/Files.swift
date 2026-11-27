@@ -42,7 +42,7 @@ struct FolderView: View {
     @State private var moving: URL?
     @State private var info: String?
 
-    private let mediaExt = ["mp4", "m4v", "mov", "mp3", "m4a", "aac", "wav", "flac", "caf", "aiff"]
+    private let mediaExt = ["mp4", "m4v", "mov", "mp3", "m4a", "aac", "wav", "flac", "caf", "aiff", "ts", "m2ts", "mts"]
     private let videoExt = ["mp4", "m4v", "mov"]
 
     private func isDir(_ u: URL) -> Bool { (try? u.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false }
@@ -180,10 +180,14 @@ struct FolderView: View {
         let dest = DownloadManager.shared.uniqueURL(u.deletingLastPathComponent(), u.deletingPathExtension().lastPathComponent + ".mp4")
         Task.detached(priority: .userInitiated) {
             do {
-                try TSRemux.convert(ts: u, to: dest)
-                await MainActor.run { info = "Converted: \(dest.lastPathComponent)"; reload() }
+                let noAudio = try TSRemux.convert(ts: u, to: dest)
+                await MainActor.run {
+                    info = "Converted: \(dest.lastPathComponent)" + (noAudio ? " (audio format not supported, saved without sound)" : "")
+                    reload()
+                }
             } catch {
-                await MainActor.run { info = "Couldn't convert this file. Only H.264 video with AAC audio is supported." }
+                let why = TSRemux.describe(error)
+                await MainActor.run { info = "Couldn't convert: \(why)" }
             }
         }
     }

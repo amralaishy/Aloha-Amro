@@ -145,15 +145,16 @@ final class DownloadManager: NSObject, ObservableObject, WKDownloadDelegate, URL
                     // Transport-stream segments: repackage as a real MP4 (no re-encoding)
                     do {
                         let out = dest
-                        try await Task.detached(priority: .userInitiated) {
+                        let dropped = try await Task.detached(priority: .userInitiated) {
                             try TSRemux.convert(ts: vFile, to: out) { p in
                                 DispatchQueue.main.async { item.progress = 0.9 + p * 0.1 }
                             }
                         }.value
+                        if dropped { note = "Saved without sound (audio format not supported)" }
                     } catch {
                         dest = self.uniqueURL(Paths.downloads, "\(title) \(v.label).ts")
                         try FileManager.default.moveItem(at: vFile, to: dest)
-                        note = "Saved as .ts (couldn't convert to MP4)"
+                        note = "Saved as .ts. MP4 conversion failed: " + TSRemux.describe(error)
                     }
                 } else if let a = v.audio {
                     let aBase = tmp.appendingPathComponent(UUID().uuidString)
@@ -234,7 +235,7 @@ struct DownloadRow: View {
                     ProgressView(value: item.progress)
                     Button { DownloadManager.shared.cancel(item) } label: { Image(systemName: "xmark.circle") }
                 }
-            case .done: Label(item.note ?? "Saved to Files › Downloads", systemImage: item.note == nil ? "checkmark.circle" : "exclamationmark.circle").font(.caption).foregroundColor(item.note == nil ? .green : .orange)
+            case .done: Label(item.note ?? "Saved to Files › Downloads", systemImage: item.note == nil ? "checkmark.circle" : "exclamationmark.circle").font(.caption).foregroundColor(item.note == nil ? .green : .orange).lineLimit(6)
             case .failed: Label(item.note ?? "Failed", systemImage: "exclamationmark.triangle").font(.caption).foregroundColor(.red)
             }
         }

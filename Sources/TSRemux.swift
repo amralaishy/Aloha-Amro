@@ -3,6 +3,11 @@ import AVFoundation
 import CoreMedia
 
 enum RemuxError: Error { case unsupported(String), noVideo, write }
+struct RemuxFailure: Error { let text: String }
+
+fileprivate func readPTS(_ b: [UInt8], _ i: Int) -> Int64 {
+    (Int64(b[i] & 0x0E) << 29) | (Int64(b[i + 1]) << 22) | (Int64(b[i + 2] & 0xFE) << 14) | (Int64(b[i + 3]) << 7) | (Int64(b[i + 4]) >> 1)
+}
 
 /// Converts an MPEG transport stream (H.264 video + AAC audio) into an MP4 without re-encoding.
 /// Streams the input from disk, so file size is not limited by memory.
@@ -10,18 +15,90 @@ final class TSRemux {
     struct VSample { var data: [UInt8]; var pts: Int64; var dts: Int64; var dur: Int64; var key: Bool }
     struct ASample { var data: [UInt8]; var pts: Int64 }
 
-    static func convert(ts: URL, to mp4: URL, progress: @escaping (Double) -> Void = { _ in }) throws {
-        let r = TSRemux(src: ts, dst: mp4, progress: progress)
-        do { try r.run() } catch {
-            r.writer?.cancelWriting()
+    static func describe(_ e: Error) -> String { (e as? RemuxFailure)?.text ?? e.localizedDescription }
+
+    /// Returns true when the audio had to be dropped (video-only fallback).
+    @discardableResult
+    static func convert(ts: URL, to mp4: URL, progress: @escaping (Double) -> Void = { _ in }) throws -> Bool {
+        let first = TSRemux(src: ts, dst: mp4, progress: progress, skipAudio: false)
+        do {
+            try first.run()
+            return false
+        } catch let e1 {
+            first.writer?.cancelWriting()
             try? FileManager.default.removeItem(at: mp4)
-            throw error
+            guard first.audioPID >= 0 else { throw RemuxFailure(text: first.report(e1)) }
+            let second = TSRemux(src: ts, dst: mp4, progress: progress, skipAudio: true)
+            do {
+                try second.run()
+                return true
+            } catch let e2 {
+                second.writer?.cancelWriting()
+                try? FileManager.default.removeItem(at: mp4)
+                throw RemuxFailure(text: second.report(e2) + " || with audio: " + first.report(e1))
+            }
         }
     }
 
     private let src: URL, dst: URL
     private let progress: (Double) -> Void
-    private init(src: URL, dst: URL, progress: @escaping (Double) -> Void) { self.src = src; self.dst = dst; self.progress = progress }
+    private var stage = "demux"
+    private var pkts = 0, vFrames = 0, aFrames = 0, vMade = 0, aMade = 0
+    private var vShift: Int64 = 0
+    private var aAnchor: Int64 = -1, aCount: Int64 = 0
+    private var vclSeen = 0
+
+    private init(src: URL, dst: URL, progress: @escaping (Double) -> Void, skipAudio: Bool) {
+        self.src = src; self.dst = dst; self.progress = progress; self.giveUpAudio = skipAudio
+    }
+
+    private func errText(_ e: Error?) -> String {
+        guard let e else { return "-" }
+        let n = e as NSError
+        return "\(n.domain) \(n.code) \(n.localizedDescription)"
+    }
+
+    private func report(_ e: Error) -> String {
+        let what: String
+        switch e {
+        case RemuxError.unsupported(let c): what = "unsupported codec \(c)"
+        case RemuxError.noVideo: what = "no H.264 video found"
+        case RemuxError.write: what = "write failed"
+        default: what = errText(e)
+        }
+        return "[\(stage)] \(what); writer: \(errText(writer?.error)); packets \(pkts); vPID \(videoPID) aPID \(audioPID); SPS \(sps != nil) PPS \(pps != nil); frames v\(vMade)/a\(aMade) written v\(vFrames)/a\(aFrames)"
+    }
+
+    /// Duration estimate in seconds, from first/last PTS in the file.
+    static func duration(of url: URL) -> Double? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+        let size = (try? fh.seekToEnd()) ?? 0
+        let span = 188 * 4000
+        func scan(_ off: UInt64) -> [Int64] {
+            try? fh.seek(toOffset: off)
+            let b = [UInt8]((try? fh.read(upToCount: span)) ?? Data())
+            var out: [Int64] = []
+            var i = 0
+            while i + 188 < b.count, !(b[i] == 0x47 && b[i + 188] == 0x47) { i += 1 }
+            while i + 188 <= b.count {
+                if b[i] == 0x47, b[i + 1] & 0x40 != 0 {
+                    let afc = (b[i + 3] >> 4) & 3
+                    var s = i + 4
+                    if afc & 2 != 0 { s += 1 + Int(b[i + 4]) }
+                    if afc & 1 != 0, s + 14 <= i + 188, b[s] == 0, b[s + 1] == 0, b[s + 2] == 1,
+                       (b[s + 3] & 0xF0) == 0xE0, (b[s + 7] >> 6) >= 2 { out.append(readPTS(b, s + 9)) }
+                }
+                i += 188
+            }
+            return out
+        }
+        let head = scan(0)
+        let tailOff: UInt64 = size > UInt64(span) ? ((size - UInt64(span)) / 188) * 188 : 0
+        let tail = scan(tailOff)
+        guard let a = head.min(), let z = tail.max(), z > a else { return nil }
+        return Double(z - a) / 90000 + 1
+    }
 
     private var pmtPID = -1, videoPID = -1, audioPID = -1
     private var vBuf = [UInt8](), aBuf = [UInt8]()
@@ -48,7 +125,6 @@ final class TSRemux {
         defer { try? fh.close() }
         let total = max(1, ((try? FileManager.default.attributesOfItem(atPath: src.path)[.size]) as? NSNumber)?.intValue ?? 1)
         var carry = [UInt8]()
-        var synced = false
         var read = 0
         while true {
             var finished = false
@@ -57,25 +133,30 @@ final class TSRemux {
                 read += chunk.count
                 let buf = carry + [UInt8](chunk)
                 var i = 0
-                if !synced {
-                    while i + 188 < buf.count, !(buf[i] == 0x47 && buf[i + 188] == 0x47) { i += 1 }
-                    synced = true
-                }
                 while i + 188 <= buf.count {
-                    if buf[i] != 0x47 { i += 1; continue }
-                    try packet(buf, i)
-                    i += 188
+                    if buf[i] == 0x47 {
+                        try packet(buf, i)
+                        i += 188
+                    } else {
+                        // lost sync (e.g. junk between segments): find the next verified packet start
+                        var j = i + 1
+                        while j + 188 < buf.count, !(buf[j] == 0x47 && buf[j + 188] == 0x47) { j += 1 }
+                        if j + 188 >= buf.count { break }
+                        i = j
+                    }
                 }
                 carry = Array(buf[i...])
                 progress(min(1, Double(read) / Double(total)))
             }
             if finished { break }
         }
+        stage = "flush"
         try flushVideo()
         try flushAudio()
         if var p = pendingV { p.dur = lastDur; vq.append(p); pendingV = nil }
         try pump(final: true)
         guard let w = writer else { throw RemuxError.noVideo }
+        stage = "finish"
         vIn?.markAsFinished(); aIn?.markAsFinished()
         let sem = DispatchSemaphore(value: 0)
         w.finishWriting { sem.signal() }
@@ -85,10 +166,11 @@ final class TSRemux {
 
     // MARK: TS parsing
     private func readTS(_ b: [UInt8], _ i: Int) -> Int64 {
-        (Int64(b[i] & 0x0E) << 29) | (Int64(b[i + 1]) << 22) | (Int64(b[i + 2] & 0xFE) << 14) | (Int64(b[i + 3]) << 7) | (Int64(b[i + 4]) >> 1)
+        readPTS(b, i)
     }
 
     private func packet(_ b: [UInt8], _ o: Int) throws {
+        pkts += 1
         if b[o + 1] & 0x80 != 0 { return }
         let pusi = (b[o + 1] & 0x40) != 0
         let pid = (Int(b[o + 1] & 0x1F) << 8) | Int(b[o + 2])
@@ -96,6 +178,7 @@ final class TSRemux {
         var s = o + 4
         if afc & 2 != 0 { s += 1 + Int(b[o + 4]) }
         let e = o + 188
+        if pid == 0x1FFF { return }
         guard afc & 1 != 0, s < e else { return }
 
         if pid == 0 {
@@ -212,6 +295,7 @@ final class TSRemux {
             }
         }
         guard vcl else { return }
+        vclSeen += 1
         if vfd == nil {
             guard let s = sps, let p = pps else { return }
             var fd: CMVideoFormatDescription?
@@ -226,23 +310,32 @@ final class TSRemux {
             guard st == noErr, fd != nil else { throw RemuxError.write }
             vfd = fd
         }
-        if !gotKey { if key { gotKey = true } else { return } }
-        let cur = VSample(data: out, pts: h.pts, dts: h.dts, dur: 0, key: key)
+        if !gotKey {
+            // some streams start on a recovery point instead of an IDR; don't wait forever
+            if key || vclSeen > 30 { gotKey = true; key = true } else { return }
+        }
+        var dts = h.dts + vShift, pts = h.pts + vShift
         if var p = pendingV {
-            var d = cur.dts - p.dts
-            if d <= 0 { d = lastDur }
+            var d = dts - p.dts
+            if d <= 0 || d > 90000 * 5 {          // timestamp jump or rollover: stitch the timeline
+                let fix = (p.dts + lastDur) - dts
+                vShift += fix; dts += fix; pts += fix
+                d = lastDur
+            }
             lastDur = d
             p.dur = d
             vq.append(p)
+            vMade += 1
         }
-        pendingV = cur
+        pendingV = VSample(data: out, pts: pts, dts: dts, dur: 0, key: key)
         try pump(final: false)
     }
 
     // MARK: audio
     private func flushAudio() throws {
         guard let start = aHeaderPTS, !aBuf.isEmpty else { return }
-        var i = 0, idx: Int64 = 0
+        if giveUpAudio { aBuf.removeAll(); return }
+        var i = 0
         while i + 7 <= aBuf.count {
             guard aBuf[i] == 0xFF, (aBuf[i + 1] & 0xF0) == 0xF0 else { i += 1; continue }
             let prot = aBuf[i + 1] & 1
@@ -256,9 +349,15 @@ final class TSRemux {
                 sampleRate = rates[sfi]
                 try makeAudioFD(aot: prof + 1, sfi: sfi, ch: max(ch, 1))
             }
-            let pts = start + idx * 1024 * 90000 / Int64(sampleRate)
+            let frameTicks = Int64(1024 * 90000 / sampleRate)
+            let shifted = start + vShift
+            if aAnchor < 0 || abs(shifted - (aAnchor + aCount * 1024 * 90000 / Int64(sampleRate))) > frameTicks * 2 {
+                aAnchor = shifted; aCount = 0      // (re)anchor on timestamp jumps
+            }
+            let pts = aAnchor + aCount * 1024 * 90000 / Int64(sampleRate)
             aq.append(ASample(data: Array(aBuf[(i + hdr)..<(i + len)]), pts: pts))
-            idx += 1
+            aMade += 1
+            aCount += 1
             i += len
         }
         try pump(final: false)
@@ -285,6 +384,7 @@ final class TSRemux {
 
     // MARK: writing
     private func startIfReady(final: Bool) throws {
+        stage = "start-writer"
         let needAudio = audioPID >= 0 && !giveUpAudio
         if needAudio, afd == nil, vq.count > 3000 { giveUpAudio = true }
         guard vfd != nil, !vq.isEmpty else {
@@ -351,6 +451,7 @@ final class TSRemux {
     }
 
     private func appendVideo(_ s: VSample) throws {
+        stage = "append-video"
         guard let vi = vIn, let fd = vfd, let bb = block(s.data) else { throw RemuxError.write }
         var timing = CMSampleTimingInfo(duration: CMTime(value: s.dur, timescale: 90000),
                                         presentationTimeStamp: CMTime(value: s.pts - base, timescale: 90000),
@@ -368,9 +469,11 @@ final class TSRemux {
         }
         try waitReady(vi)
         guard vi.append(buf) else { throw writer?.error ?? RemuxError.write }
+        vFrames += 1
     }
 
     private func appendAudio(_ s: ASample) throws {
+        stage = "append-audio"
         guard let ai = aIn, let fd = afd, let bb = block(s.data) else { throw RemuxError.write }
         var desc = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(s.data.count))
         var sb: CMSampleBuffer?
@@ -381,5 +484,23 @@ final class TSRemux {
         guard st == noErr, let buf = sb else { throw RemuxError.write }
         try waitReady(ai)
         guard ai.append(buf) else { throw writer?.error ?? RemuxError.write }
+        aFrames += 1
+    }
+}
+
+
+/// Lets the in-app player open raw .ts files by wrapping them in a one-segment local HLS playlist.
+enum TSPlayback {
+    static func playableURL(for url: URL) -> URL {
+        guard ["ts", "m2ts", "mts"].contains(url.pathExtension.lowercased()) else { return url }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("tsplay-" + UUID().uuidString)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let link = dir.appendingPathComponent("media.ts")
+        do { try FileManager.default.createSymbolicLink(at: link, withDestinationURL: url) } catch { return url }
+        let dur = TSRemux.duration(of: url) ?? 3600
+        let text = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:\(Int(dur.rounded(.up)) + 1)\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:\(String(format: "%.3f", dur)),\nmedia.ts\n#EXT-X-ENDLIST\n"
+        let pl = dir.appendingPathComponent("index.m3u8")
+        do { try text.write(to: pl, atomically: true, encoding: .utf8) } catch { return url }
+        return pl
     }
 }
