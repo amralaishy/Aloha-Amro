@@ -27,6 +27,7 @@ struct RootView: View {
     @EnvironmentObject var settings: Settings
     @Environment(\.scenePhase) var phase
     @State private var locked = Settings.shared.appLock
+    @State private var openedFile: URL?
 
     var body: some View {
         ZStack {
@@ -42,6 +43,12 @@ struct RootView: View {
             }
         }
         .onAppear { if locked { unlock() } }
+        .onOpenURL { url in
+            guard url.isFileURL else { return }
+            _ = url.startAccessingSecurityScopedResource()
+            openedFile = url
+        }
+        .fullScreenCover(item: $openedFile) { PlayerView(url: $0) }
         .onChange(of: phase) { p in
             if p == .background && settings.appLock { locked = true }
             if p == .active && locked { unlock() }
